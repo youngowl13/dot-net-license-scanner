@@ -65,14 +65,14 @@ type NuGetRegistration struct {
 
 // PackageReport holds the result of scanning a package.
 type PackageReport struct {
-	PackageID         string             // e.g., "AutoMapper"
-	Version           string             // e.g., "12.0.1" or "unknown"
-	LicenseExpression string             // e.g., "MIT" or "GPL-3.0-only"
-	LicenseURL        string             // e.g., "https://licenses.nuget.org/MIT"
-	IsCopyleft        bool               // determined by isCopyleft()
-	Dependencies      []*PackageReport   // Transitive dependencies
-	Level             int                // 0 = direct dependency, >0 = transitive
-	IntroducedBy      []string           // Direct dependency names that introduced this package
+	PackageID         string
+	Version           string
+	LicenseExpression string
+	LicenseURL        string
+	IsCopyleft        bool
+	Dependencies      []*PackageReport // Transitive dependencies
+	Level             int              // 0 = direct dependency, >0 = transitive
+	IntroducedBy      []string         // Direct dependency names that introduced this package
 }
 
 // Summary holds combined statistics.
@@ -84,9 +84,8 @@ type Summary struct {
 }
 
 // ----------------------------
-// Concurrency Control
+// Concurrency Control (Limit to 20)
 // ----------------------------
-
 var concurrencySem = make(chan struct{}, 20)
 
 func acquireSemaphore() {
@@ -101,7 +100,7 @@ func releaseSemaphore() {
 // Version Normalization
 // ----------------------------
 
-// normalizeVersion removes trailing ".0" segments. For example, "4.0.0.0" becomes "4.0.0".
+// normalizeVersion removes trailing ".0" segments (e.g., "4.0.0.0" becomes "4.0.0").
 func normalizeVersion(ver string) string {
 	if ver == "" {
 		return ""
@@ -171,8 +170,8 @@ func parseVersionFromRange(rangeStr string) string {
 	return rangeStr
 }
 
-// getPackageInfo queries NuGet's registration API for a given package ID and version.
-// If version is empty, it picks the latest version available.
+// getPackageInfo queries NuGet's registration API for a package.
+// If version is empty, it picks the latest version.
 func getPackageInfo(packageID, version string) (string, string, []DependencyGroup, error) {
 	url := fmt.Sprintf("https://api.nuget.org/v3/registration5-semver1/%s/index.json", strings.ToLower(packageID))
 	resp, err := http.Get(url)
@@ -191,7 +190,6 @@ func getPackageInfo(packageID, version string) (string, string, []DependencyGrou
 	if err := json.Unmarshal(body, &reg); err != nil {
 		return "", "", nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
-
 	if version == "" {
 		if len(reg.Items) == 0 {
 			return "", "", nil, fmt.Errorf("no registration items for package %s", packageID)
@@ -203,7 +201,6 @@ func getPackageInfo(packageID, version string) (string, string, []DependencyGrou
 		entry := lastPage.Items[len(lastPage.Items)-1].CatalogEntry
 		return entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
 	}
-
 	for _, page := range reg.Items {
 		for _, item := range page.Items {
 			entry := item.CatalogEntry
@@ -215,24 +212,12 @@ func getPackageInfo(packageID, version string) (string, string, []DependencyGrou
 	return "", "", nil, fmt.Errorf("version %s not found for package %s", version, packageID)
 }
 
-// isCopyleft returns true if the given license string indicates a copyleft license.
-func isCopyleft(license string) bool {
-	copyleftLicenses := []string{"GPL-2.0", "GPL-3.0", "LGPL-2.1", "LGPL-3.0", "AGPL-3.0"}
-	upper := strings.ToUpper(license)
-	for _, cl := range copyleftLicenses {
-		if strings.Contains(upper, strings.ToUpper(cl)) {
-			return true
-		}
-	}
-	return false
-}
-
 // ----------------------------
 // Scanning Logic
 // ----------------------------
 
 // processPackage recursively processes a package and its dependencies.
-// topLevels is a slice of direct dependency names (the Include values) that introduced this package.
+// topLevels is a slice of direct dependency names that introduced this package.
 func processPackage(
 	pkgID, version string,
 	visited map[string]*PackageReport,
@@ -268,18 +253,19 @@ func processPackage(
 		fmt.Printf("Already processed %s@%s, merging top-levels.\n", pkgID, normVersion)
 		return existing
 	}
+	visitedMu.Unlock()
 
 	displayVersion := version
 	if displayVersion == "" {
 		displayVersion = "unknown"
 	}
-
 	report := &PackageReport{
 		PackageID:    pkgID,
 		Version:      displayVersion,
 		Level:        level,
 		IntroducedBy: append([]string{}, topLevels...),
 	}
+	visitedMu.Lock()
 	visited[key] = report
 	visitedMu.Unlock()
 
@@ -297,7 +283,6 @@ func processPackage(
 
 	var childWg sync.WaitGroup
 	var childMu sync.Mutex
-
 	for _, group := range depGroups {
 		for _, dep := range group.Dependencies {
 			depVer := parseVersionFromRange(dep.Range)
@@ -339,7 +324,7 @@ func flattenBFS(reports []*PackageReport) []*PackageReport {
 // HTML Report Generation
 // ----------------------------
 
-// toHTMLDFS produces a nested DFS tree as HTML for a single PackageReport.
+// toHTMLDFS produces a nested DFS tree as HTML for a single PackageReport (without debug info).
 func toHTMLDFS(r *PackageReport) string {
 	cssClass := getCssClass(r)
 	var sb strings.Builder
@@ -373,9 +358,7 @@ func buildHTMLForOneFile(
 	sb.WriteString(fmt.Sprintf("<h2>Dependency List for %s</h2>\n", csprojPath))
 	flat := flattenBFS(reports)
 	sort.Slice(flat, func(i, j int) bool {
-		// Sort by license priority: red (copyleft) first, then unknown, then non-copyleft.
-		pi := 2
-		pj := 2
+		pi, pj := 2, 2
 		if flat[i].IsCopyleft {
 			pi = 0
 		} else if flat[i].LicenseExpression == "" {
@@ -420,7 +403,6 @@ func buildHTMLForOneFile(
 	}
 	sb.WriteString("</ul>\n")
 
-	// Update summary stats
 	for _, rep := range flat {
 		summary.TotalPackages++
 		if rep.Level == 0 {
@@ -441,12 +423,12 @@ func generateHTMLReport(allReports map[string][]*PackageReport, summary *Summary
 	var sb strings.Builder
 	sb.WriteString("<html><head><title>Copyleft Scan Report</title>\n<style>\n")
 	sb.WriteString("body { font-family: Arial, sans-serif; }\n")
-	sb.WriteString("tr.copyleft { background-color: red; color: white; }\n")
-	sb.WriteString("tr.unknown { background-color: orange; color: black; }\n")
-	sb.WriteString("tr.non-copyleft { background-color: green; color: black; }\n")
-	sb.WriteString("li.copyleft { background-color: red; color: white; padding: 5px; margin: 3px; }\n")
-	sb.WriteString("li.unknown { background-color: orange; color: black; padding: 5px; margin: 3px; }\n")
-	sb.WriteString("li.non-copyleft { background-color: green; color: black; padding: 5px; margin: 3px; }\n")
+	sb.WriteString("tr.copyleft { background-color: red; }\n")
+	sb.WriteString("tr.unknown { background-color: orange; }\n")
+	sb.WriteString("tr.non-copyleft { background-color: green; }\n")
+	sb.WriteString("li.copyleft { background-color: red; padding: 5px; margin: 3px; }\n")
+	sb.WriteString("li.unknown { background-color: orange; padding: 5px; margin: 3px; }\n")
+	sb.WriteString("li.non-copyleft { background-color: green; padding: 5px; margin: 3px; }\n")
 	sb.WriteString("table, th, td { border: 1px solid #ccc; border-collapse: collapse; padding: 5px; }\n")
 	sb.WriteString("th { background-color: #f0f0f0; }\n")
 	sb.WriteString("ul { list-style-type: none; }\n")
@@ -484,7 +466,7 @@ func findCsprojFiles(rootPath string) ([]string, error) {
 }
 
 // ----------------------------
-// MAIN
+// Main
 // ----------------------------
 
 func main() {
@@ -528,7 +510,7 @@ func main() {
 		var wg sync.WaitGroup
 		var reports []*PackageReport
 
-		// Use each direct dependency's Include as the top-level identifier.
+		// For each direct dependency, use its Include as the top-level identifier.
 		for _, group := range proj.ItemGroups {
 			for _, pkg := range group.PackageReferences {
 				wg.Add(1)
