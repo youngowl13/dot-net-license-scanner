@@ -171,38 +171,38 @@ func parseVersionFromRange(rangeStr string) string {
 	return rangeStr
 }
 
-// getPackageInfo returns (actualVersion, licenseExpression, licenseURL, depGroups, error).
-// If version is empty, we pick the latest version from the NuGet data.
-func getPackageInfo(packageID, version string) (string, string, string, []DependencyGroup, error) {
+// getPackageInfo queries NuGet's registration API for a given package ID and version.
+// If version is empty, it picks the latest available version from the data.
+func getPackageInfo(packageID, version string) (licenseExpression, licenseURL string, depGroups []DependencyGroup, err error) {
 	url := fmt.Sprintf("https://api.nuget.org/v3/registration5-semver1/%s/index.json", strings.ToLower(packageID))
 	resp, err := http.Get(url)
 	if err != nil {
-		return "", "", "", nil, fmt.Errorf("failed to get package info: %w", err)
+		return "", "", nil, fmt.Errorf("failed to get package info: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", "", "", nil, fmt.Errorf("received non-OK HTTP status: %s", resp.Status)
+		return "", "", nil, fmt.Errorf("received non-OK HTTP status: %s", resp.Status)
 	}
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", "", nil, fmt.Errorf("failed to read response body: %w", err)
+		return "", "", nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 	var reg NuGetRegistration
 	if err := json.Unmarshal(body, &reg); err != nil {
-		return "", "", "", nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+		return "", "", nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
+	// If version is empty, pick the license info from the latest version
 	if version == "" {
-		// Use the latest version from the last page
 		if len(reg.Items) == 0 {
-			return "", "", "", nil, fmt.Errorf("no registration items for package %s", packageID)
+			return "", "", nil, fmt.Errorf("no registration items for package %s", packageID)
 		}
 		lastPage := reg.Items[len(reg.Items)-1]
 		if len(lastPage.Items) == 0 {
-			return "", "", "", nil, fmt.Errorf("no items in the last page for package %s", packageID)
+			return "", "", nil, fmt.Errorf("no items in the last page for package %s", packageID)
 		}
 		entry := lastPage.Items[len(lastPage.Items)-1].CatalogEntry
-		return entry.Version, entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
+		return entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
 	}
 
 	// Otherwise, look for the specified version
@@ -210,11 +210,11 @@ func getPackageInfo(packageID, version string) (string, string, string, []Depend
 		for _, item := range page.Items {
 			entry := item.CatalogEntry
 			if entry.Version == version {
-				return entry.Version, entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
+				return entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
 			}
 		}
 	}
-	return "", "", "", nil, fmt.Errorf("version %s not found for package %s", version, packageID)
+	return "", "", nil, fmt.Errorf("version %s not found for package %s", version, packageID)
 }
 
 // isCopyleft checks if the license string indicates a copyleft license.
@@ -239,8 +239,8 @@ func isCopyleft(license string) bool {
 // Scanning Logic
 // ----------------------------
 
-// processPackage recursively processes a package. If version is omitted in the csproj,
-// we fetch the license info using the latest version but display "version not known" in the BFS table.
+// processPackage recursively processes a package. If the .csproj omitted version,
+// we fetch the license info using the latest version but display "version not known" in BFS table.
 func processPackage(
 	pkgID, version string,
 	visited map[string]*PackageReport,
@@ -267,7 +267,6 @@ func processPackage(
 
 	visitedMu.Lock()
 	if existing, found := visited[key]; found {
-		// Merge top-levels
 		for _, t := range topLevels {
 			if !containsString(existing.IntroducedBy, t) {
 				existing.IntroducedBy = append(existing.IntroducedBy, t)
@@ -279,8 +278,7 @@ func processPackage(
 	}
 	visitedMu.Unlock()
 
-	// If csproj omitted version, we display "version not known" in the BFS table
-	// but still fetch the license info from the latest version.
+	// If csproj omitted version, display "version not known" in BFS table
 	displayVersion := version
 	if displayVersion == "" {
 		displayVersion = "version not known"
@@ -299,8 +297,8 @@ func processPackage(
 
 	fmt.Printf("Processing package: %s@%s\n", pkgID, normVersion)
 
-	// Attempt to fetch actual version + license info
-	actualVersion, licenseExpr, licenseURL, depGroups, err := getPackageInfo(pkgID, version)
+	// Attempt to fetch license info (and transitive deps) using the latest version if omitted
+	licenseExpr, licenseURL, depGroups, err := getPackageInfo(pkgID, version)
 	if err != nil {
 		fmt.Printf("Error retrieving license info for %s@%s: %v\n", pkgID, version, err)
 		return report
