@@ -88,12 +88,10 @@ type Summary struct {
 // We'll use a semaphore (channel) to limit concurrency to 20 goroutines.
 var concurrencySem = make(chan struct{}, 20)
 
-// acquireSemaphore waits for capacity in the concurrencySem.
 func acquireSemaphore() {
 	concurrencySem <- struct{}{}
 }
 
-// releaseSemaphore frees up capacity in the concurrencySem.
 func releaseSemaphore() {
 	<-concurrencySem
 }
@@ -106,7 +104,7 @@ func releaseSemaphore() {
 //   "4.0.0.0" -> "4.0.0"
 //   "1.2.3.0" -> "1.2.3"
 //   "2.0.0"   -> "2.0"
-//   "5.0"     -> "5.0" (unchanged, because only one trailing zero)
+//   "5.0"     -> "5.0" (unchanged if only one trailing zero)
 func normalizeVersion(ver string) string {
 	if ver == "" {
 		return ""
@@ -124,11 +122,24 @@ func normalizeVersion(ver string) string {
 // -----------------------------------------------------------------------------
 
 // skipFrameworkAssembly returns true if the package should be ignored
-// because it's a known .NET framework assembly (e.g. "System.*", "Microsoft.Win32.*").
+// because it's part of the .NET framework or runtime, rather than a normal NuGet package.
+// We skip anything starting with "System.", "Microsoft.", plus some well-known
+// assemblies like "mscorlib", "WindowsBase", "PresentationCore", etc.
 func skipFrameworkAssembly(packageID string) bool {
 	idLower := strings.ToLower(packageID)
-	return strings.HasPrefix(idLower, "system.") ||
-		strings.HasPrefix(idLower, "microsoft.win32.")
+
+	// Skip if it starts with these prefixes:
+	if strings.HasPrefix(idLower, "system.") ||
+		strings.HasPrefix(idLower, "microsoft.") ||
+		strings.HasPrefix(idLower, "netstandard") ||
+		strings.HasPrefix(idLower, "mscorlib") ||
+		strings.HasPrefix(idLower, "windowsbase") ||
+		strings.HasPrefix(idLower, "presentationcore") ||
+		strings.HasPrefix(idLower, "presentationframework") {
+		return true
+	}
+
+	return false
 }
 
 // -----------------------------------------------------------------------------
@@ -214,13 +225,16 @@ func getPackageInfo(packageID, version string) (string, string, []DependencyGrou
 		return "", "", nil, fmt.Errorf("failed to get package info: %w", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return "", "", nil, fmt.Errorf("received non-OK HTTP status: %s", resp.Status)
 	}
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", "", nil, fmt.Errorf("failed to read response body: %w", err)
 	}
+
 	var reg NuGetRegistration
 	if err := json.Unmarshal(body, &reg); err != nil {
 		return "", "", nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
@@ -277,14 +291,13 @@ func processPackage(
 	acquireSemaphore()
 	defer releaseSemaphore()
 
-	// Skip known framework assemblies (e.g., "System.*", "Microsoft.Win32.*").
+	// If this is obviously a framework assembly, skip it.
 	if skipFrameworkAssembly(packageID) {
 		fmt.Printf("%sSkipping framework assembly: %s\n", indent, packageID)
 		return nil
 	}
 
-	// Normalize the version for the visited key, but still use the original version
-	// when calling getPackageInfo.
+	// Normalize version for the visited key.
 	normVersion := normalizeVersion(version)
 	key := packageID + "@" + normVersion
 
@@ -294,6 +307,7 @@ func processPackage(
 
 	visitedMu.Lock()
 	if existing, found := visited[key]; found {
+		// Merge any new top-level sources.
 		for _, t := range topLevels {
 			if !containsString(existing.IntroducedBy, t) {
 				existing.IntroducedBy = append(existing.IntroducedBy, t)
@@ -305,7 +319,6 @@ func processPackage(
 		return existing
 	}
 
-	// If no version is specified, display "unknown".
 	displayVersion := version
 	if displayVersion == "" {
 		displayVersion = "unknown"
@@ -518,7 +531,8 @@ func findCsprojFiles(rootPath string) ([]string, error) {
 }
 
 func main() {
-	// Fixed defaults: search current directory, produce "report.html"
+	// Always search the current directory for .csproj files
+	// and write the output to "report.html".
 	rootPath := "."
 	outHTML := "report.html"
 
@@ -562,10 +576,6 @@ func main() {
 			for _, pkg := range group.PackageReferences {
 				wg.Add(1)
 				go func(pkg PackageReference, topID string) {
-					defer func() {
-						// If the goroutine panics or returns, ensure we don't leak the WaitGroup.
-						// (Though the concurrencySem is also handled within processPackage).
-					}()
 					rep := processPackage(pkg.Include, pkg.Version, visited, 0, "", []string{topID}, &wg, &visitedMu)
 					if rep != nil {
 						reportsMu.Lock()
