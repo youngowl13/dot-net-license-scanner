@@ -15,18 +15,16 @@ import (
 	"sync"
 )
 
-// ----------------------------
-// Data Types
-// ----------------------------
+// ---------------------------------
+// Data Structures
+// ---------------------------------
 
-// PackageReference represents a NuGet package reference in a csproj.
 type PackageReference struct {
 	XMLName xml.Name `xml:"PackageReference"`
-	Include string   `xml:"Include,attr"` // e.g., "AutoMapper"
-	Version string   `xml:"Version,attr"` // e.g., "12.0.1"
+	Include string   `xml:"Include,attr"` // e.g. "AutoMapper"
+	Version string   `xml:"Version,attr"` // e.g. "12.0.1"
 }
 
-// Project represents a simplified csproj file structure.
 type Project struct {
 	XMLName    xml.Name `xml:"Project"`
 	ItemGroups []struct {
@@ -34,19 +32,17 @@ type Project struct {
 	} `xml:"ItemGroup"`
 }
 
-// Dependency from NuGet metadata.
+// NuGet metadata
 type Dependency struct {
 	Id    string `json:"id"`
 	Range string `json:"range"`
 }
 
-// DependencyGroup from NuGet metadata.
 type DependencyGroup struct {
 	TargetFramework string       `json:"targetFramework"`
 	Dependencies    []Dependency `json:"dependencies"`
 }
 
-// CatalogEntry from NuGet metadata.
 type CatalogEntry struct {
 	Version           string            `json:"version"`
 	LicenseExpression string            `json:"licenseExpression"`
@@ -54,7 +50,6 @@ type CatalogEntry struct {
 	DependencyGroups  []DependencyGroup `json:"dependencyGroups"`
 }
 
-// NuGetRegistration from NuGet metadata.
 type NuGetRegistration struct {
 	Items []struct {
 		Items []struct {
@@ -63,19 +58,18 @@ type NuGetRegistration struct {
 	} `json:"items"`
 }
 
-// PackageReport holds the result of scanning a package.
+// Final report data
 type PackageReport struct {
 	PackageID         string
 	Version           string // e.g. "12.0.1" or "version not known"
-	LicenseExpression string // e.g. "MIT", or empty if not found
+	LicenseExpression string // e.g. "MIT" or empty
 	LicenseURL        string
 	IsCopyleft        bool
 	Dependencies      []*PackageReport
-	Level             int      // 0 = direct dependency, >0 = transitive
-	IntroducedBy      []string // Direct dependency names that introduced this package
+	Level             int      // 0=direct, >0=transitive
+	IntroducedBy      []string // direct dependencies that introduced this package
 }
 
-// Summary holds combined statistics.
 type Summary struct {
 	TotalPackages      int
 	DirectPackages     int
@@ -83,9 +77,9 @@ type Summary struct {
 	CopyleftPackages   int
 }
 
-// ----------------------------
-// Concurrency Control (Limit to 20)
-// ----------------------------
+// ---------------------------------
+// Concurrency Limit (20)
+// ---------------------------------
 
 var concurrencySem = make(chan struct{}, 20)
 
@@ -97,26 +91,9 @@ func releaseSemaphore() {
 	<-concurrencySem
 }
 
-// ----------------------------
-// Version Normalization
-// ----------------------------
-
-// normalizeVersion removes trailing ".0" segments.
-// For example, "4.0.0.0" -> "4.0.0".
-func normalizeVersion(ver string) string {
-	if ver == "" {
-		return ""
-	}
-	parts := strings.Split(ver, ".")
-	for len(parts) > 1 && parts[len(parts)-1] == "0" {
-		parts = parts[:len(parts)-1]
-	}
-	return strings.Join(parts, ".")
-}
-
-// ----------------------------
-// Skip Known .NET Framework Assemblies
-// ----------------------------
+// ---------------------------------
+// Helper: skip .NET framework assemblies
+// ---------------------------------
 
 func skipFrameworkAssembly(packageID string) bool {
 	idLower := strings.ToLower(packageID)
@@ -132,22 +109,25 @@ func skipFrameworkAssembly(packageID string) bool {
 	return false
 }
 
-// ----------------------------
-// Helper Functions
-// ----------------------------
+// ---------------------------------
+// Helper: normalize version
+// ---------------------------------
 
-// getCssClass returns a CSS class for row/item coloring.
-func getCssClass(rep *PackageReport) string {
-	if rep.IsCopyleft {
-		return "copyleft"
+func normalizeVersion(ver string) string {
+	if ver == "" {
+		return ""
 	}
-	if rep.LicenseExpression == "" {
-		return "unknown"
+	parts := strings.Split(ver, ".")
+	for len(parts) > 1 && parts[len(parts)-1] == "0" {
+		parts = parts[:len(parts)-1]
 	}
-	return "non-copyleft"
+	return strings.Join(parts, ".")
 }
 
-// containsString checks if a slice contains a given string.
+// ---------------------------------
+// Helper: string slice
+// ---------------------------------
+
 func containsString(slice []string, s string) bool {
 	for _, item := range slice {
 		if item == s {
@@ -157,7 +137,10 @@ func containsString(slice []string, s string) bool {
 	return false
 }
 
-// parseVersionFromRange extracts a version from a dependency range string, e.g. "[1.2.3, )" -> "1.2.3".
+// ---------------------------------
+// Helper: parseVersionFromRange
+// ---------------------------------
+
 func parseVersionFromRange(rangeStr string) string {
 	if rangeStr == "" {
 		return ""
@@ -171,53 +154,10 @@ func parseVersionFromRange(rangeStr string) string {
 	return rangeStr
 }
 
-// getPackageInfo queries NuGet's registration API for a given package ID and version.
-// If version is empty, it picks the latest available version from the data.
-func getPackageInfo(packageID, version string) (licenseExpression, licenseURL string, depGroups []DependencyGroup, err error) {
-	url := fmt.Sprintf("https://api.nuget.org/v3/registration5-semver1/%s/index.json", strings.ToLower(packageID))
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("failed to get package info: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", "", nil, fmt.Errorf("received non-OK HTTP status: %s", resp.Status)
-	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-	var reg NuGetRegistration
-	if err := json.Unmarshal(body, &reg); err != nil {
-		return "", "", nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
-	}
+// ---------------------------------
+// License detection
+// ---------------------------------
 
-	// If version is empty, pick the license info from the latest version
-	if version == "" {
-		if len(reg.Items) == 0 {
-			return "", "", nil, fmt.Errorf("no registration items for package %s", packageID)
-		}
-		lastPage := reg.Items[len(reg.Items)-1]
-		if len(lastPage.Items) == 0 {
-			return "", "", nil, fmt.Errorf("no items in the last page for package %s", packageID)
-		}
-		entry := lastPage.Items[len(lastPage.Items)-1].CatalogEntry
-		return entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
-	}
-
-	// Otherwise, look for the specified version
-	for _, page := range reg.Items {
-		for _, item := range page.Items {
-			entry := item.CatalogEntry
-			if entry.Version == version {
-				return entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
-			}
-		}
-	}
-	return "", "", nil, fmt.Errorf("version %s not found for package %s", version, packageID)
-}
-
-// isCopyleft checks if the license string indicates a copyleft license.
 func isCopyleft(license string) bool {
 	lower := strings.ToLower(license)
 	candidates := []string{
@@ -235,12 +175,89 @@ func isCopyleft(license string) bool {
 	return false
 }
 
-// ----------------------------
-// Scanning Logic
-// ----------------------------
+// ---------------------------------
+// getPackageInfo: fetch license info from NuGet
+// ---------------------------------
 
-// processPackage recursively processes a package. If the .csproj omitted version,
-// we fetch the license info using the latest version but display "version not known" in BFS table.
+func getPackageInfo(packageID, version string) (string, string, []DependencyGroup, error) {
+	url := fmt.Sprintf("https://api.nuget.org/v3/registration5-semver1/%s/index.json", strings.ToLower(packageID))
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to get package info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", nil, fmt.Errorf("received non-OK HTTP status: %s", resp.Status)
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	var reg NuGetRegistration
+	if err := json.Unmarshal(body, &reg); err != nil {
+		return "", "", nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	// If no version specified, pick the latest version from the last page
+	if version == "" {
+		if len(reg.Items) == 0 {
+			return "", "", nil, fmt.Errorf("no registration items for package %s", packageID)
+		}
+		lastPage := reg.Items[len(reg.Items)-1]
+		if len(lastPage.Items) == 0 {
+			return "", "", nil, fmt.Errorf("no items in the last page for package %s", packageID)
+		}
+		entry := lastPage.Items[len(lastPage.Items)-1].CatalogEntry
+		return entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
+	}
+
+	// Otherwise, find the specified version
+	for _, page := range reg.Items {
+		for _, item := range page.Items {
+			entry := item.CatalogEntry
+			if entry.Version == version {
+				return entry.LicenseExpression, entry.LicenseURL, entry.DependencyGroups, nil
+			}
+		}
+	}
+	return "", "", nil, fmt.Errorf("version %s not found for package %s", version, packageID)
+}
+
+// ---------------------------------
+// BFS flatten
+// ---------------------------------
+
+func flattenBFS(reports []*PackageReport) []*PackageReport {
+	var result []*PackageReport
+	queue := append([]*PackageReport{}, reports...)
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		result = append(result, current)
+		queue = append(queue, current.Dependencies...)
+	}
+	return result
+}
+
+// ---------------------------------
+// getCssClass
+// ---------------------------------
+
+func getCssClass(rep *PackageReport) string {
+	if rep.IsCopyleft {
+		return "copyleft"
+	}
+	if rep.LicenseExpression == "" {
+		return "unknown"
+	}
+	return "non-copyleft"
+}
+
+// ---------------------------------
+// processPackage: main scanning logic
+// ---------------------------------
+
 func processPackage(
 	pkgID, version string,
 	visited map[string]*PackageReport,
@@ -253,6 +270,7 @@ func processPackage(
 	acquireSemaphore()
 	defer releaseSemaphore()
 
+	// Skip .NET assemblies
 	if skipFrameworkAssembly(pkgID) {
 		fmt.Printf("Skipping framework assembly: %s\n", pkgID)
 		return nil
@@ -265,6 +283,7 @@ func processPackage(
 	normVersion := normalizeVersion(version)
 	key := pkgID + "@" + normVersion
 
+	// If we have already processed it, merge top-levels
 	visitedMu.Lock()
 	if existing, found := visited[key]; found {
 		for _, t := range topLevels {
@@ -278,7 +297,7 @@ func processPackage(
 	}
 	visitedMu.Unlock()
 
-	// If csproj omitted version, display "version not known" in BFS table
+	// If .csproj omitted version, we display "version not known"
 	displayVersion := version
 	if displayVersion == "" {
 		displayVersion = "version not known"
@@ -297,22 +316,20 @@ func processPackage(
 
 	fmt.Printf("Processing package: %s@%s\n", pkgID, normVersion)
 
-	// Attempt to fetch license info (and transitive deps) using the latest version if omitted
 	licenseExpr, licenseURL, depGroups, err := getPackageInfo(pkgID, version)
 	if err != nil {
 		fmt.Printf("Error retrieving license info for %s@%s: %v\n", pkgID, version, err)
 		return report
 	}
-
 	report.LicenseExpression = licenseExpr
 	report.LicenseURL = licenseURL
 	if isCopyleft(licenseExpr) {
 		report.IsCopyleft = true
 	}
 
+	// Recurse transitive dependencies
 	var childWg sync.WaitGroup
 	var childMu sync.Mutex
-
 	for _, group := range depGroups {
 		for _, dep := range group.Dependencies {
 			depVer := parseVersionFromRange(dep.Range)
@@ -337,65 +354,17 @@ func processPackage(
 	return report
 }
 
-// flattenBFS returns a slice of PackageReports in breadth-first order.
-func flattenBFS(reports []*PackageReport) []*PackageReport {
-	var result []*PackageReport
-	queue := append([]*PackageReport{}, reports...)
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		result = append(result, current)
-		queue = append(queue, current.Dependencies...)
-	}
-	return result
-}
+// ---------------------------------
+// buildHTMLForOneFile
+// ---------------------------------
 
-// ----------------------------
-// HTML Report Generation
-// ----------------------------
-
-// toHTMLDFS produces a nested DFS tree as HTML for a single PackageReport.
-func toHTMLDFS(r *PackageReport) string {
-	cssClass := getCssClass(r)
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("<li class=\"%s\">", cssClass))
-
-	// If the license expression is empty, show "license not known"
-	licenseToShow := r.LicenseExpression
-	if licenseToShow == "" {
-		licenseToShow = "license not known"
-	}
-
-	sb.WriteString(fmt.Sprintf("<strong>%s@%s</strong> ", r.PackageID, r.Version))
-	sb.WriteString(fmt.Sprintf("License: %s", licenseToShow))
-	if r.LicenseURL != "" {
-		sb.WriteString(fmt.Sprintf(" (<a href=\"%s\">License URL</a>)", r.LicenseURL))
-	}
-	if r.Level > 0 && len(r.IntroducedBy) > 0 {
-		sb.WriteString(fmt.Sprintf("<br/><em>Introduced by: %s</em>", strings.Join(r.IntroducedBy, ", ")))
-	}
-	if len(r.Dependencies) > 0 {
-		sb.WriteString("<ul>")
-		for _, child := range r.Dependencies {
-			sb.WriteString(toHTMLDFS(child))
-		}
-		sb.WriteString("</ul>")
-	}
-	sb.WriteString("</li>\n")
-	return sb.String()
-}
-
-// buildHTMLForOneFile builds the BFS table + DFS tree for a single csproj file.
-func buildHTMLForOneFile(
-	csprojPath string,
-	reports []*PackageReport,
-	summary *Summary,
-) string {
+func buildHTMLForOneFile(csprojPath string, reports []*PackageReport, summary *Summary) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("<h2>Dependency List for %s</h2>\n", csprojPath))
 
+	// BFS flatten
 	flat := flattenBFS(reports)
-	// Sort BFS list by license priority
+	// Sort by license priority
 	sort.Slice(flat, func(i, j int) bool {
 		pi, pj := 2, 2
 		if flat[i].IsCopyleft {
@@ -411,17 +380,15 @@ func buildHTMLForOneFile(
 		return pi < pj
 	})
 
+	// BFS Table
 	sb.WriteString("<table>\n")
 	sb.WriteString("<tr><th>Level</th><th>Package</th><th>Version</th><th>License</th><th>Info URL</th><th>Introduced By</th></tr>\n")
 	for _, rep := range flat {
 		cssClass := getCssClass(rep)
-
-		// If the license expression is empty, show "license not known"
 		licenseToShow := rep.LicenseExpression
 		if licenseToShow == "" {
 			licenseToShow = "license not known"
 		}
-
 		sb.WriteString(fmt.Sprintf("<tr class=\"%s\">", cssClass))
 		sb.WriteString(fmt.Sprintf("<td>%d</td>", rep.Level))
 		sb.WriteString(fmt.Sprintf("<td>%s</td>", rep.PackageID))
@@ -445,6 +412,7 @@ func buildHTMLForOneFile(
 	}
 	sb.WriteString("</table>\n")
 
+	// DFS Tree
 	sb.WriteString(fmt.Sprintf("<h2>Dependency Tree for %s</h2>\n", csprojPath))
 	sb.WriteString("<ul>\n")
 	for _, rep := range reports {
@@ -452,7 +420,7 @@ func buildHTMLForOneFile(
 	}
 	sb.WriteString("</ul>\n")
 
-	// Update summary stats
+	// Update summary
 	for _, rep := range flat {
 		summary.TotalPackages++
 		if rep.Level == 0 {
@@ -467,7 +435,10 @@ func buildHTMLForOneFile(
 	return sb.String()
 }
 
-// generateHTMLReport combines BFS/DFS sections for each file + a combined summary.
+// ---------------------------------
+// generateHTMLReport
+// ---------------------------------
+
 func generateHTMLReport(allReports map[string][]*PackageReport, summary *Summary) string {
 	var sb strings.Builder
 	sb.WriteString("<html><head><title>Copyleft Scan Report</title>\n<style>\n")
@@ -482,14 +453,19 @@ func generateHTMLReport(allReports map[string][]*PackageReport, summary *Summary
 	sb.WriteString("th { background-color: #f0f0f0; }\n")
 	sb.WriteString("ul { list-style-type: none; }\n")
 	sb.WriteString("</style></head><body>\n")
+
 	sb.WriteString("<h1>Copyleft Scan Report</h1>\n")
-	sb.WriteString("<h2>Combined Summary</h2>\n<ul>\n")
+
+	// Combined Summary (will be updated by each file)
+	sb.WriteString("<h2>Combined Summary</h2>\n")
+	sb.WriteString("<ul>\n")
 	sb.WriteString(fmt.Sprintf("<li>Total Packages Scanned: %d</li>\n", summary.TotalPackages))
 	sb.WriteString(fmt.Sprintf("<li>Direct Packages: %d</li>\n", summary.DirectPackages))
 	sb.WriteString(fmt.Sprintf("<li>Transitive Packages: %d</li>\n", summary.TransitivePackages))
 	sb.WriteString(fmt.Sprintf("<li>Copyleft Packages: %d</li>\n", summary.CopyleftPackages))
 	sb.WriteString("</ul>\n")
 
+	// For each .csproj file
 	for path, reports := range allReports {
 		sb.WriteString(buildHTMLForOneFile(path, reports, summary))
 	}
@@ -498,9 +474,9 @@ func generateHTMLReport(allReports map[string][]*PackageReport, summary *Summary
 	return sb.String()
 }
 
-// ----------------------------
-// File Search
-// ----------------------------
+// ---------------------------------
+// findCsprojFiles
+// ---------------------------------
 
 func findCsprojFiles(rootPath string) ([]string, error) {
 	var files []string
@@ -516,9 +492,9 @@ func findCsprojFiles(rootPath string) ([]string, error) {
 	return files, err
 }
 
-// ----------------------------
-// Main
-// ----------------------------
+// ---------------------------------
+// main
+// ---------------------------------
 
 func main() {
 	rootPath := "."
@@ -562,7 +538,7 @@ func main() {
 		var wg sync.WaitGroup
 		var reports []*PackageReport
 
-		// For each direct dependency, use its Include as the top-level identifier.
+		// For each direct dependency, spawn a goroutine
 		for _, group := range proj.ItemGroups {
 			for _, pkg := range group.PackageReferences {
 				wg.Add(1)
@@ -578,6 +554,7 @@ func main() {
 		allReports[file] = reports
 	}
 
+	// Build final HTML
 	htmlReport := generateHTMLReport(allReports, &totalSummary)
 	if err := ioutil.WriteFile(outHTML, []byte(htmlReport), 0644); err != nil {
 		log.Fatalf("Failed to write HTML report: %v", err)
