@@ -1,0 +1,44 @@
+name: License Checker Workflow
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  license-checker:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23' # Specify Go version here
+
+      # Step 3: Build and run the Go code
+      - name: Build and Run License Checker
+        run: |
+          go mod init checker || true
+          go mod tidy
+          GOOS=linux go build -o dotnet-license-checker dotnet_checker.go
+          chmod +x dotnet-license-checker
+          ls -la
+          ./dotnet-license-checker
+          ls -la
+
+      # Step 4: Upload the generated report and compiled binary as artifacts
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-report-and-binary
+          path: |
+            ./dependency-license-report.html
+            ./license-checker
