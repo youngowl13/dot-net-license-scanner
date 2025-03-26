@@ -81,6 +81,60 @@ type Summary struct {
 	ErrorCount         int
 }
 
+// -----------------------------------------------------------------------------
+// 1) CONCURRENCY CONTROL
+// -----------------------------------------------------------------------------
+
+// We'll use a semaphore (channel) to limit concurrency to 20 goroutines.
+var concurrencySem = make(chan struct{}, 20)
+
+// acquireSemaphore waits for capacity in the concurrencySem.
+func acquireSemaphore() {
+	concurrencySem <- struct{}{}
+}
+
+// releaseSemaphore frees up capacity in the concurrencySem.
+func releaseSemaphore() {
+	<-concurrencySem
+}
+
+// -----------------------------------------------------------------------------
+// 2) VERSION NORMALIZATION
+// -----------------------------------------------------------------------------
+
+// normalizeVersion removes trailing ".0" segments. For example:
+//   "4.0.0.0" -> "4.0.0"
+//   "1.2.3.0" -> "1.2.3"
+//   "2.0.0"   -> "2.0"
+//   "5.0"     -> "5.0" (unchanged, because only one trailing zero)
+func normalizeVersion(ver string) string {
+	if ver == "" {
+		return ""
+	}
+	parts := strings.Split(ver, ".")
+	// Always keep at least 1 segment
+	for len(parts) > 1 && parts[len(parts)-1] == "0" {
+		parts = parts[:len(parts)-1]
+	}
+	return strings.Join(parts, ".")
+}
+
+// -----------------------------------------------------------------------------
+// 3) SKIP KNOWN .NET FRAMEWORK ASSEMBLIES
+// -----------------------------------------------------------------------------
+
+// skipFrameworkAssembly returns true if the package should be ignored
+// because it's a known .NET framework assembly (e.g. "System.*", "Microsoft.Win32.*").
+func skipFrameworkAssembly(packageID string) bool {
+	idLower := strings.ToLower(packageID)
+	return strings.HasPrefix(idLower, "system.") ||
+		strings.HasPrefix(idLower, "microsoft.win32.")
+}
+
+// -----------------------------------------------------------------------------
+// 4) REPORT AND SCANNING LOGIC
+// -----------------------------------------------------------------------------
+
 // getCssClass returns the CSS class for a package report based on its license.
 func getCssClass(rep *PackageReport) string {
 	if rep.IsCopyleft {
@@ -208,13 +262,32 @@ func containsString(slice []string, s string) bool {
 }
 
 // processPackage recursively processes a package and its dependencies using concurrency.
-// It propagates the top-level source (the csproj file name) that introduced the dependency.
-// The visited map is protected by visitedMu.
-func processPackage(packageID, version string, visited map[string]*PackageReport, level int, indent string, topLevels []string, wg *sync.WaitGroup, visitedMu *sync.Mutex) *PackageReport {
-	if wg != nil {
-		defer wg.Done()
+func processPackage(
+	packageID, version string,
+	visited map[string]*PackageReport,
+	level int,
+	indent string,
+	topLevels []string,
+	wg *sync.WaitGroup,
+	visitedMu *sync.Mutex,
+) *PackageReport {
+	defer wg.Done()
+
+	// Concurrency limit: wait for a token before proceeding.
+	acquireSemaphore()
+	defer releaseSemaphore()
+
+	// Skip known framework assemblies (e.g., "System.*", "Microsoft.Win32.*").
+	if skipFrameworkAssembly(packageID) {
+		fmt.Printf("%sSkipping framework assembly: %s\n", indent, packageID)
+		return nil
 	}
-	key := packageID + "@" + version
+
+	// Normalize the version for the visited key, but still use the original version
+	// when calling getPackageInfo.
+	normVersion := normalizeVersion(version)
+	key := packageID + "@" + normVersion
+
 	if level == 0 && len(topLevels) == 0 {
 		topLevels = []string{packageID}
 	}
@@ -228,24 +301,27 @@ func processPackage(packageID, version string, visited map[string]*PackageReport
 			}
 		}
 		visitedMu.Unlock()
-		fmt.Printf("%sAlready processed package %s@%s, updating IntroducedBy.\n", indent, packageID, version)
+		fmt.Printf("%sAlready processed package %s@%s, updating IntroducedBy.\n", indent, packageID, normVersion)
 		return existing
 	}
+
+	// If no version is specified, display "unknown".
 	displayVersion := version
 	if displayVersion == "" {
 		displayVersion = "unknown"
 	}
+
 	report := &PackageReport{
 		PackageID:     packageID,
 		Version:       displayVersion,
 		Level:         level,
 		IntroducedBy:  append([]string{}, topLevels...),
-		DebugMessages: []string{fmt.Sprintf("Processing package %s@%s at level %d", packageID, version, level)},
+		DebugMessages: []string{fmt.Sprintf("Processing package %s@%s at level %d", packageID, normVersion, level)},
 	}
 	visited[key] = report
 	visitedMu.Unlock()
 
-	fmt.Printf("%sProcessing package: %s@%s\n", indent, packageID, version)
+	fmt.Printf("%sProcessing package: %s@%s\n", indent, packageID, normVersion)
 	license, licenseURL, depGroups, err := getPackageInfo(packageID, version)
 	if err != nil {
 		errMsg := fmt.Sprintf("Error retrieving license info: %v", err)
@@ -263,11 +339,13 @@ func processPackage(packageID, version string, visited map[string]*PackageReport
 
 	var childWg sync.WaitGroup
 	var childMu sync.Mutex
+
 	for _, group := range depGroups {
 		if len(group.Dependencies) > 0 {
 			groupMsg := fmt.Sprintf("Processing dependency group for target framework: %s", group.TargetFramework)
 			report.DebugMessages = append(report.DebugMessages, groupMsg)
 			fmt.Printf("%s%s\n", indent, groupMsg)
+
 			for _, dep := range group.Dependencies {
 				depVersion := parseVersionFromRange(dep.Range)
 				if depVersion == "" {
@@ -277,13 +355,12 @@ func processPackage(packageID, version string, visited map[string]*PackageReport
 					continue
 				}
 				fmt.Printf("%sResolving dependency: %s@%s\n", indent, dep.Id, depVersion)
+
 				childWg.Add(1)
 				go func(depID, depVer, childIndent string, childTopLevels []string) {
 					defer childWg.Done()
-					if wg != nil {
-						wg.Add(1)
-					}
-					childReport := processPackage(depID, depVer, visited, level+1, childIndent, topLevels, wg, visitedMu)
+					wg.Add(1) // Because each child also defers wg.Done() inside processPackage
+					childReport := processPackage(depID, depVer, visited, level+1, childIndent, childTopLevels, wg, visitedMu)
 					if childReport != nil {
 						childMu.Lock()
 						report.Dependencies = append(report.Dependencies, childReport)
@@ -293,6 +370,7 @@ func processPackage(packageID, version string, visited map[string]*PackageReport
 			}
 		}
 	}
+
 	childWg.Wait()
 	return report
 }
@@ -329,9 +407,12 @@ func getLicensePriority(rep *PackageReport) int {
 func generateHTMLReport(reports []*PackageReport) string {
 	summary := Summary{}
 	flat := flattenBFS(reports)
+
+	// Sort flat list by license priority: red (0) first, then yellow (1), then green (2)
 	sort.Slice(flat, func(i, j int) bool {
 		return getLicensePriority(flat[i]) < getLicensePriority(flat[j])
 	})
+
 	summary.TotalPackages = len(flat)
 	for _, rep := range flat {
 		if rep.Level == 0 {
@@ -349,6 +430,7 @@ func generateHTMLReport(reports []*PackageReport) string {
 			}
 		}
 	}
+
 	var sb strings.Builder
 	sb.WriteString("<html><head><title>Copyleft Scan Report</title>")
 	sb.WriteString("<style>")
@@ -363,7 +445,9 @@ func generateHTMLReport(reports []*PackageReport) string {
 	sb.WriteString("details summary { cursor: pointer; }")
 	sb.WriteString("</style>")
 	sb.WriteString("</head><body>")
+
 	sb.WriteString("<h1>Copyleft Scan Report</h1>")
+	// Summary Section
 	sb.WriteString("<h2>Summary</h2>")
 	sb.WriteString("<ul>")
 	sb.WriteString(fmt.Sprintf("<li>Total Packages Scanned: %d</li>", summary.TotalPackages))
@@ -372,12 +456,16 @@ func generateHTMLReport(reports []*PackageReport) string {
 	sb.WriteString(fmt.Sprintf("<li>Copyleft Packages: %d</li>", summary.CopyleftPackages))
 	sb.WriteString(fmt.Sprintf("<li>Errors Encountered: %d</li>", summary.ErrorCount))
 	sb.WriteString("</ul>")
+
+	// Nested Tree View
 	sb.WriteString("<h2>Dependency Tree (Nested View)</h2>")
 	sb.WriteString("<ul>")
 	for _, report := range reports {
 		sb.WriteString(report.toHTML())
 	}
 	sb.WriteString("</ul>")
+
+	// BFS Table View
 	sb.WriteString("<h2>Dependency List (BFS Order)</h2>")
 	sb.WriteString("<table>")
 	sb.WriteString("<tr><th>Level</th><th>Package</th><th>Version</th><th>License</th><th>Info URL</th><th>Introduced By</th><th>Debug Info</th></tr>")
@@ -388,6 +476,8 @@ func generateHTMLReport(reports []*PackageReport) string {
 		sb.WriteString(fmt.Sprintf("<td>%s</td>", rep.PackageID))
 		sb.WriteString(fmt.Sprintf("<td>%s</td>", rep.Version))
 		sb.WriteString(fmt.Sprintf("<td>%s</td>", rep.LicenseExpression))
+
+		// Info URL: If license is known, link to NuGet; else link to Google search.
 		var infoURL string
 		if rep.LicenseExpression != "" {
 			infoURL = fmt.Sprintf("https://www.nuget.org/packages/%s", rep.PackageID)
@@ -395,16 +485,19 @@ func generateHTMLReport(reports []*PackageReport) string {
 			infoURL = fmt.Sprintf("https://www.google.com/search?q=%s", rep.PackageID)
 		}
 		sb.WriteString(fmt.Sprintf("<td><a href=\"%s\">Link</a></td>", infoURL))
+
 		intro := "N/A"
 		if len(rep.IntroducedBy) > 0 {
 			intro = strings.Join(rep.IntroducedBy, ", ")
 		}
 		sb.WriteString(fmt.Sprintf("<td>%s</td>", intro))
+
 		debugInfo := strings.Join(rep.DebugMessages, " | ")
 		sb.WriteString(fmt.Sprintf("<td>%s</td>", debugInfo))
 		sb.WriteString("</tr>")
 	}
 	sb.WriteString("</table>")
+
 	sb.WriteString("</body></html>")
 	return sb.String()
 }
@@ -425,10 +518,10 @@ func findCsprojFiles(rootPath string) ([]string, error) {
 }
 
 func main() {
-	// Since this is intended for GitHub Actions, use fixed defaults.
-	rootPath := "."           // Search recursively from the current directory.
-	outHTML := "report.html"  // Output report file.
-	
+	// Fixed defaults: search current directory, produce "report.html"
+	rootPath := "."
+	outHTML := "report.html"
+
 	info, err := os.Stat(rootPath)
 	if err != nil {
 		log.Fatalf("Failed to stat path: %v", err)
@@ -464,10 +557,15 @@ func main() {
 			continue
 		}
 		topLevelID := filepath.Base(file)
+
 		for _, group := range proj.ItemGroups {
 			for _, pkg := range group.PackageReferences {
 				wg.Add(1)
 				go func(pkg PackageReference, topID string) {
+					defer func() {
+						// If the goroutine panics or returns, ensure we don't leak the WaitGroup.
+						// (Though the concurrencySem is also handled within processPackage).
+					}()
 					rep := processPackage(pkg.Include, pkg.Version, visited, 0, "", []string{topID}, &wg, &visitedMu)
 					if rep != nil {
 						reportsMu.Lock()
@@ -480,6 +578,7 @@ func main() {
 	}
 
 	wg.Wait()
+
 	htmlReport := generateHTMLReport(reports)
 	if err := ioutil.WriteFile(outHTML, []byte(htmlReport), 0644); err != nil {
 		log.Fatalf("Failed to write HTML report: %v", err)
