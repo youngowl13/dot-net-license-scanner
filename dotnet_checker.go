@@ -170,8 +170,8 @@ func parseVersionFromRange(rangeStr string) string {
 	return rangeStr
 }
 
-// getPackageInfo queries NuGet's registration API for a package.
-// If version is empty, it picks the latest version.
+// getPackageInfo queries NuGet's registration API for a given package ID and version.
+// If version is empty, it picks the latest available version.
 func getPackageInfo(packageID, version string) (string, string, []DependencyGroup, error) {
 	url := fmt.Sprintf("https://api.nuget.org/v3/registration5-semver1/%s/index.json", strings.ToLower(packageID))
 	resp, err := http.Get(url)
@@ -212,12 +212,31 @@ func getPackageInfo(packageID, version string) (string, string, []DependencyGrou
 	return "", "", nil, fmt.Errorf("version %s not found for package %s", version, packageID)
 }
 
+// isCopyleft returns true if the given license string indicates a copyleft license.
+// This function checks several common full-form and abbreviated identifiers.
+func isCopyleft(license string) bool {
+	lower := strings.ToLower(license)
+	candidates := []string{
+		"gpl-2.0", "gpl 2.0", "gnu general public license v2", "gnu gpl v2",
+		"gpl-3.0", "gpl 3.0", "gnu general public license v3", "gnu gpl v3",
+		"lgpl-2.1", "lgpl 2.1", "gnu lesser general public license v2.1", "gnu lgpl v2.1",
+		"lgpl-3.0", "lgpl 3.0", "gnu lesser general public license v3", "gnu lgpl v3",
+		"agpl-3.0", "agpl 3.0", "gnu affero general public license",
+	}
+	for _, candidate := range candidates {
+		if strings.Contains(lower, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 // ----------------------------
 // Scanning Logic
 // ----------------------------
 
 // processPackage recursively processes a package and its dependencies.
-// topLevels is a slice of direct dependency names that introduced this package.
+// topLevels is a slice of direct dependency names (the Include values) that introduced this package.
 func processPackage(
 	pkgID, version string,
 	visited map[string]*PackageReport,
@@ -414,7 +433,6 @@ func buildHTMLForOneFile(
 			summary.CopyleftPackages++
 		}
 	}
-
 	return sb.String()
 }
 
