@@ -40,5 +40,5 @@ jobs:
         with:
           name: license-report-and-binary
           path: |
-            ./dependency-license-report.html
-            ./license-checker
+            ./report.html
+            ./dotnet-license-checker
