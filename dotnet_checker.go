@@ -15,6 +15,10 @@ import (
 	"sync"
 )
 
+// ----------------------------
+// Data Types
+// ----------------------------
+
 // PackageReference represents a NuGet package reference in a csproj.
 type PackageReference struct {
 	XMLName xml.Name `xml:"PackageReference"`
@@ -61,14 +65,14 @@ type NuGetRegistration struct {
 
 // PackageReport holds the result of scanning a package.
 type PackageReport struct {
-	PackageID         string
-	Version           string
-	LicenseExpression string
-	LicenseURL        string
-	IsCopyleft        bool
-	Dependencies      []*PackageReport // Transitive dependencies
-	Level             int              // 0 = direct dependency, >0 = transitive
-	IntroducedBy      []string         // Direct dependency names that introduced this package
+	PackageID         string             // e.g., "AutoMapper"
+	Version           string             // e.g., "12.0.1" or "unknown"
+	LicenseExpression string             // e.g., "MIT" or "GPL-3.0-only"
+	LicenseURL        string             // e.g., "https://licenses.nuget.org/MIT"
+	IsCopyleft        bool               // determined by isCopyleft()
+	Dependencies      []*PackageReport   // Transitive dependencies
+	Level             int                // 0 = direct dependency, >0 = transitive
+	IntroducedBy      []string           // Direct dependency names that introduced this package
 }
 
 // Summary holds combined statistics.
@@ -77,12 +81,11 @@ type Summary struct {
 	DirectPackages     int
 	TransitivePackages int
 	CopyleftPackages   int
-	ErrorCount         int
 }
 
-// -----------------------------------------------------------------------------
-// CONCURRENCY CONTROL (LIMIT TO 20)
-// -----------------------------------------------------------------------------
+// ----------------------------
+// Concurrency Control
+// ----------------------------
 
 var concurrencySem = make(chan struct{}, 20)
 
@@ -94,12 +97,11 @@ func releaseSemaphore() {
 	<-concurrencySem
 }
 
-// -----------------------------------------------------------------------------
-// VERSION NORMALIZATION
-// -----------------------------------------------------------------------------
+// ----------------------------
+// Version Normalization
+// ----------------------------
 
-// normalizeVersion removes trailing ".0" segments.
-// For example, "4.0.0.0" becomes "4.0.0"
+// normalizeVersion removes trailing ".0" segments. For example, "4.0.0.0" becomes "4.0.0".
 func normalizeVersion(ver string) string {
 	if ver == "" {
 		return ""
@@ -111,13 +113,12 @@ func normalizeVersion(ver string) string {
 	return strings.Join(parts, ".")
 }
 
-// -----------------------------------------------------------------------------
-// SKIP KNOWN .NET FRAMEWORK ASSEMBLIES
-// -----------------------------------------------------------------------------
+// ----------------------------
+// Skip Known .NET Framework Assemblies
+// ----------------------------
 
 func skipFrameworkAssembly(packageID string) bool {
 	idLower := strings.ToLower(packageID)
-	// Skip well-known framework assemblies.
 	if strings.HasPrefix(idLower, "system.") ||
 		strings.HasPrefix(idLower, "microsoft.") ||
 		strings.HasPrefix(idLower, "netstandard") ||
@@ -130,9 +131,9 @@ func skipFrameworkAssembly(packageID string) bool {
 	return false
 }
 
-// -----------------------------------------------------------------------------
-// HELPER FUNCTIONS
-// -----------------------------------------------------------------------------
+// ----------------------------
+// Helper Functions
+// ----------------------------
 
 // getCssClass returns the CSS class for a package report.
 func getCssClass(rep *PackageReport) string {
@@ -170,8 +171,8 @@ func parseVersionFromRange(rangeStr string) string {
 	return rangeStr
 }
 
-// getPackageInfo queries NuGet's registration API for a package.
-// If version is empty, it returns the latest version.
+// getPackageInfo queries NuGet's registration API for a given package ID and version.
+// If version is empty, it picks the latest version available.
 func getPackageInfo(packageID, version string) (string, string, []DependencyGroup, error) {
 	url := fmt.Sprintf("https://api.nuget.org/v3/registration5-semver1/%s/index.json", strings.ToLower(packageID))
 	resp, err := http.Get(url)
@@ -214,12 +215,24 @@ func getPackageInfo(packageID, version string) (string, string, []DependencyGrou
 	return "", "", nil, fmt.Errorf("version %s not found for package %s", version, packageID)
 }
 
-// -----------------------------------------------------------------------------
-// SCANNING LOGIC
-// -----------------------------------------------------------------------------
+// isCopyleft returns true if the given license string indicates a copyleft license.
+func isCopyleft(license string) bool {
+	copyleftLicenses := []string{"GPL-2.0", "GPL-3.0", "LGPL-2.1", "LGPL-3.0", "AGPL-3.0"}
+	upper := strings.ToUpper(license)
+	for _, cl := range copyleftLicenses {
+		if strings.Contains(upper, strings.ToUpper(cl)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ----------------------------
+// Scanning Logic
+// ----------------------------
 
 // processPackage recursively processes a package and its dependencies.
-// topLevels is a slice of the direct dependency names that introduced this package.
+// topLevels is a slice of direct dependency names (the Include values) that introduced this package.
 func processPackage(
 	pkgID, version string,
 	visited map[string]*PackageReport,
@@ -322,19 +335,9 @@ func flattenBFS(reports []*PackageReport) []*PackageReport {
 	return result
 }
 
-func getLicensePriority(rep *PackageReport) int {
-	if rep.IsCopyleft {
-		return 0
-	}
-	if rep.LicenseExpression == "" {
-		return 1
-	}
-	return 2
-}
-
-// -----------------------------------------------------------------------------
-// HTML REPORT GENERATION
-// -----------------------------------------------------------------------------
+// ----------------------------
+// HTML Report Generation
+// ----------------------------
 
 // toHTMLDFS produces a nested DFS tree as HTML for a single PackageReport.
 func toHTMLDFS(r *PackageReport) string {
@@ -367,12 +370,23 @@ func buildHTMLForOneFile(
 	summary *Summary,
 ) string {
 	var sb strings.Builder
-
-	// Heading with file path
 	sb.WriteString(fmt.Sprintf("<h2>Dependency List for %s</h2>\n", csprojPath))
 	flat := flattenBFS(reports)
 	sort.Slice(flat, func(i, j int) bool {
-		return getLicensePriority(flat[i]) < getLicensePriority(flat[j])
+		// Sort by license priority: red (copyleft) first, then unknown, then non-copyleft.
+		pi := 2
+		pj := 2
+		if flat[i].IsCopyleft {
+			pi = 0
+		} else if flat[i].LicenseExpression == "" {
+			pi = 1
+		}
+		if flat[j].IsCopyleft {
+			pj = 0
+		} else if flat[j].LicenseExpression == "" {
+			pj = 1
+		}
+		return pi < pj
 	})
 	sb.WriteString("<table>\n")
 	sb.WriteString("<tr><th>Level</th><th>Package</th><th>Version</th><th>License</th><th>Info URL</th><th>Introduced By</th></tr>\n")
@@ -451,9 +465,10 @@ func generateHTMLReport(allReports map[string][]*PackageReport, summary *Summary
 	return sb.String()
 }
 
-// -----------------------------------------------------------------------------
-// findCsprojFiles recursively finds all .csproj files starting from rootPath.
-// -----------------------------------------------------------------------------
+// ----------------------------
+// File Search
+// ----------------------------
+
 func findCsprojFiles(rootPath string) ([]string, error) {
 	var files []string
 	err := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
@@ -468,9 +483,9 @@ func findCsprojFiles(rootPath string) ([]string, error) {
 	return files, err
 }
 
-// -----------------------------------------------------------------------------
+// ----------------------------
 // MAIN
-// -----------------------------------------------------------------------------
+// ----------------------------
 
 func main() {
 	rootPath := "."
@@ -513,7 +528,7 @@ func main() {
 		var wg sync.WaitGroup
 		var reports []*PackageReport
 
-		// For each direct dependency in the csproj, use its Include as the top-level identifier.
+		// Use each direct dependency's Include as the top-level identifier.
 		for _, group := range proj.ItemGroups {
 			for _, pkg := range group.PackageReferences {
 				wg.Add(1)
